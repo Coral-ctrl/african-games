@@ -1,0 +1,3 @@
+pygame
+numpy
+# openai  # optional - only needed for the live AI narrator; the game works fine without it

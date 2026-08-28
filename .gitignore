@@ -1,0 +1,15 @@
+# Virtual environments
+.venv/
+.venv0/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor settings — remove this line if you'd rather share it with the team
+.vscode/
+
+# OS clutter
+.DS_Store
