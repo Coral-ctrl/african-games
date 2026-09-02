@@ -1,75 +1,3 @@
-"""
-Village Nights
-A small anthology of three Pygame mini-games, loosely inspired by
-communal West African traditions of drumming, strategy play, and
-weaving. One old village "Storyteller" - voiced live by a GenAI model -
-narrates a single ongoing tale across whichever game you're playing,
-growing bolder when you're doing well and stumbling gently (never
-cruelly) when you slip.
-
-Press 1, 2, or 3 from the title screen to choose a level. Each level
-is a genuinely different game, not just a difficulty tier:
-
-  Level 1 - "Rhythm of the Village" (Easy)
-      The original drum-and-beat rhythm game. Notes fall toward a
-      drum - hit SPACE right as each one lands. Tuned slower than
-      earlier versions (longer note travel time, gentler tempo ramp)
-      so the timing stays forgiving even on a slower or busier
-      machine - useful if you're running this in a constrained
-      sandbox where frame pacing isn't perfectly smooth.
-
-  Level 2 - "Oware Trade Routes" (Medium)
-      A simplified single-player version of Oware (also known as Ayo
-      or Awari), a traditional Mancala-family strategy game played
-      widely across West Africa. Click a pit on your row to sow its
-      seeds counter-clockwise around the board; land your last seed
-      in an opponent pit that then holds 2 or 3 seeds and you capture
-      it. Play against a small heuristic "elder" AI. This is a casual
-      simplification for a mini-game, not a tournament-accurate
-      ruleset (for example, it does not implement the "grand slam"
-      restriction some official rule sets use).
-
-  Level 3 - "Kente Loom" (Hard)
-      A Simon-Says-style memory game themed around Kente cloth
-      weaving, the famous brightly-coloured, geometrically patterned
-      textile historically associated with royalty among the Akan
-      people of Ghana. Watch a growing sequence of coloured "threads"
-      flash on the loom, then repeat it back using the A/S/D/F/G keys
-      (or by clicking the pads). A mistake gently shortens the
-      pattern by one thread rather than ending the game - you just
-      try again.
-
-HOW GENAI IS USED
-------------------
-At meaningful moments in any of the three games (starting a level, a
-combo/capture/clean-weave milestone, a miss/flaw, or finishing) the
-game sends a short prompt to an OpenAI chat model asking the
-Storyteller to continue one ongoing tale in a single vivid sentence.
-The call runs on a background thread so none of the three games ever
-freezes waiting on a network response.
-
-If no OPENAI_API_KEY is set, or a request fails, the game falls back
-to a small set of pre-written narrator lines per event - always fully
-playable either way.
-
-HOW SOUND WORKS
-----------------
-All sound effects are synthesized in code with NumPy (short sine
-tones shaped with a decay envelope) - no external audio files are
-needed, so the whole game stays a single, self-contained Python file.
-If NumPy or an audio device isn't available, the game simply runs
-silently instead of crashing.
-
-HOW TO PLAY
------------
-- Choose a level:      1, 2, or 3 from the title or end screen
-- Rhythm (Level 1):    SPACE, timed to each falling note
-- Oware (Level 2):     click a pit on your (bottom) row
-- Kente (Level 3):     A / S / D / F / G keys, or click a pad
-- Play again:          SPACE (same level) once a level ends
-- Quit:                close the window, or ESC
-"""
-
 import os
 import random
 import threading
@@ -92,7 +20,7 @@ except Exception:
 # isn't available, the game silently runs without it.
 try:
     import numpy as np
-except Exception:
+except (ImportError, ModuleNotFoundError):
     np = None
 
 OPENAI_MODEL = "gpt-4o-mini"
@@ -164,6 +92,12 @@ FALLBACK_LINES = {
 WIDTH, HEIGHT = 480, 720
 FPS = 60
 
+# Looping background track for the whole game (title screen through all
+# three levels). Kept quiet relative to the synthesized SFX so drum ticks
+# and pad tones still stand out over it.
+MUSIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "african_music.mpeg")
+MUSIC_VOLUME = 0.35
+
 NIGHT = (35, 28, 26)        # warm dark backdrop, like firelight at dusk
 EMBER = (220, 130, 60)
 GOLD = (235, 190, 90)
@@ -181,7 +115,11 @@ BUBBLE_BORDER = (220, 130, 60)
 # regardless of how many lines the current line actually needs. That keeps
 # every other layout (Oware's pit positions, in particular) stable frame to
 # frame instead of shifting whenever the narrator's line changes length.
-BUBBLE_TOP = 16
+# BUBBLE_TOP leaves room above the bubble for the menu button (see
+# compute_menu_button_rect) - increasing it shifts every other layout that
+# derives from bubble_bottom_y() down by the same amount, so nothing else
+# needs separate adjustment to stay clear of it.
+BUBBLE_TOP = 44
 BUBBLE_PADDING = 14
 BUBBLE_MAX_LINES = 3
 
@@ -314,9 +252,8 @@ class SoundBank:
 
     def __init__(self):
         self.enabled = False
+        self.music_enabled = False
         self.sounds = {}
-        if np is None:
-            return  # NumPy missing - game will just run silently
         try:
             pygame.mixer.init(frequency=self.SAMPLE_RATE, size=-16, channels=1)
             # Some platforms/drivers ignore the requested channel count, so
@@ -324,19 +261,35 @@ class SoundBank:
             # otherwise make_sound() raises a dimension mismatch.
             init_info = pygame.mixer.get_init()
             self.channels = init_info[2] if init_info else 1
-            self.sounds["tick"] = self._tone(95, 140, volume=0.35, sweep_to=55)
-            self.sounds["start"] = self._tone(523, 220, volume=0.4)
-            self.sounds["perfect"] = self._tone(880, 120, volume=0.5)
-            self.sounds["good"] = self._tone(660, 120, volume=0.45)
-            self.sounds["ok"] = self._tone(440, 120, volume=0.4)
-            self.sounds["miss"] = self._tone(260, 200, volume=0.4, sweep_to=140)
-            self.sounds["end"] = self._chord([523, 659, 784], 550, volume=0.4)
-            self.sounds["capture"] = self._tone(700, 180, volume=0.45, sweep_to=950)
-            for i, freq in enumerate(PENTATONIC_FREQS):
-                self.sounds[f"pad{i}"] = self._tone(freq, 220, volume=0.4)
-            self.enabled = True
         except Exception:
-            self.enabled = False  # e.g. no audio device available - that's fine
+            return  # e.g. no audio device available - that's fine
+
+        # The synthesized SFX need NumPy to generate their waveforms, but
+        # background music is just a file being streamed, so it can still
+        # play even when NumPy is missing.
+        if np is not None:
+            try:
+                self.sounds["tick"] = self._tone(95, 140, volume=0.35, sweep_to=55)
+                self.sounds["start"] = self._tone(523, 220, volume=0.4)
+                self.sounds["perfect"] = self._tone(880, 120, volume=0.5)
+                self.sounds["good"] = self._tone(660, 120, volume=0.45)
+                self.sounds["ok"] = self._tone(440, 120, volume=0.4)
+                self.sounds["miss"] = self._tone(260, 200, volume=0.4, sweep_to=140)
+                self.sounds["end"] = self._chord([523, 659, 784], 550, volume=0.4)
+                self.sounds["capture"] = self._tone(700, 180, volume=0.45, sweep_to=950)
+                for i, freq in enumerate(PENTATONIC_FREQS):
+                    self.sounds[f"pad{i}"] = self._tone(freq, 220, volume=0.4)
+                self.enabled = True
+            except Exception:
+                self.enabled = False
+
+        try:
+            pygame.mixer.music.load(MUSIC_FILE)
+            pygame.mixer.music.set_volume(MUSIC_VOLUME)
+            pygame.mixer.music.play(loops=-1)
+            self.music_enabled = True
+        except Exception:
+            self.music_enabled = False  # e.g. missing/unsupported file - game still runs
 
     def _tone(self, freq, duration_ms, volume=0.5, sweep_to=None):
         """A single sine tone with an exponential-decay envelope, giving it
@@ -557,11 +510,15 @@ def draw_rhythm(screen, sub, bubble_bottom, now, fonts):
     pygame.draw.circle(screen, EMBER, (LANE_X, HIT_LINE_Y), drum_radius, 4)
     pygame.draw.line(screen, GOLD, (LANE_X - 60, HIT_LINE_Y), (LANE_X + 60, HIT_LINE_Y), 2)
 
+    # Notes should never spawn underneath the story bubble - clamp their
+    # start position to whichever is lower, the usual NOTE_START_Y or just
+    # past wherever the bubble currently ends.
+    note_start_y = max(NOTE_START_Y, bubble_bottom + 20)
     for note in sub["notes"]:
         if not note["judged"]:
             fraction = 1 - (note["target_time"] - now) / cfg["travel_ms"]
             fraction = max(0.0, min(1.2, fraction))
-            y = NOTE_START_Y + fraction * (HIT_LINE_Y - NOTE_START_Y)
+            y = note_start_y + fraction * (HIT_LINE_Y - note_start_y)
             pygame.draw.circle(screen, GOLD, (LANE_X, int(y)), NOTE_RADIUS)
             pygame.draw.circle(screen, BLACK, (LANE_X, int(y)), NOTE_RADIUS, 2)
         else:
@@ -687,11 +644,15 @@ def finish_oware(sub, storyteller):
 def compute_oware_layout(font_small):
     """Pit positions, derived the same way whether we're drawing this
     frame or hit-testing a click that arrived before it - see
-    bubble_bottom_y for why that stability matters."""
-    top = bubble_bottom_y(font_small) + 56
+    bubble_bottom_y for why that stability matters. Each element's y is
+    stacked explicitly off the one before it (rather than each being
+    separately reverse-derived from the pit row, which is what let the
+    status/harvest text drift into overlapping the bubble)."""
+    status_y = bubble_bottom_y(font_small) + 28
+    ai_label_y = status_y + 26
+    ai_row_y = ai_label_y + 55
     row_gap = 250
-    ai_row_y = top
-    player_row_y = top + row_gap
+    player_row_y = ai_row_y + row_gap
     margin = 40
     usable_width = WIDTH - margin * 2
     pit_radius = 30
@@ -713,7 +674,14 @@ def compute_oware_layout(font_small):
         rect.center = (int(cx), int(ai_row_y))
         pit_rects[pit_index] = rect
 
-    return {"pit_rects": pit_rects, "pit_radius": pit_radius, "ai_row_y": ai_row_y, "player_row_y": player_row_y, "top": top}
+    return {
+        "pit_rects": pit_rects,
+        "pit_radius": pit_radius,
+        "ai_row_y": ai_row_y,
+        "player_row_y": player_row_y,
+        "status_y": status_y,
+        "ai_label_y": ai_label_y,
+    }
 
 
 def start_oware(now):
@@ -815,10 +783,10 @@ def draw_oware(screen, sub, now, fonts):
         "GAME_OVER": "The trading day is done.",
     }
     status = font_small.render(status_lines.get(sub["phase"], ""), True, GREY)
-    screen.blit(status, status.get_rect(center=(WIDTH / 2, layout["top"] - 30)))
+    screen.blit(status, status.get_rect(center=(WIDTH / 2, layout["status_y"])))
 
     ai_label = font_small.render(f"Elder's harvest: {sub['ai_store']}", True, GOLD)
-    screen.blit(ai_label, ai_label.get_rect(center=(WIDTH / 2, layout["ai_row_y"] - 55)))
+    screen.blit(ai_label, ai_label.get_rect(center=(WIDTH / 2, layout["ai_label_y"])))
 
     for i in range(6, 12):
         rect = layout["pit_rects"][i]
@@ -963,29 +931,34 @@ def draw_kente(screen, sub, now, fonts):
     font_small, font_med, font_big = fonts
     current_length = len(sub["sequence"])
 
+    # Positioned relative to the bubble's actual bottom edge (the same
+    # pattern compute_oware_layout uses) rather than fixed pixel values,
+    # so this stays correctly spaced if the bubble's height ever changes.
+    base_y = bubble_bottom_y(font_small) + 40
+
     status_lines = {
         "SHOWING": "Watch the loom...",
         "INPUT": "Your turn - repeat the pattern.",
         "COMPLETE": "The cloth is complete!",
     }
     status = font_small.render(status_lines.get(sub["phase"], ""), True, GREY)
-    screen.blit(status, status.get_rect(center=(WIDTH / 2, 150)))
+    screen.blit(status, status.get_rect(center=(WIDTH / 2, base_y)))
 
     round_render = font_med.render(f"Pattern length: {current_length} / {KENTE_CONFIG['target_rounds']}", True, GOLD)
-    screen.blit(round_render, round_render.get_rect(center=(WIDTH / 2, 185)))
+    screen.blit(round_render, round_render.get_rect(center=(WIDTH / 2, base_y + 35)))
 
     # Progress bar representing the growing cloth.
-    bar_rect = pygame.Rect(60, 215, WIDTH - 120, 18)
+    bar_rect = pygame.Rect(60, int(base_y + 65), WIDTH - 120, 18)
     pygame.draw.rect(screen, (70, 55, 50), bar_rect, border_radius=9)
     fill_width = int(bar_rect.width * min(1.0, sub["best_round"] / KENTE_CONFIG["target_rounds"]))
     if fill_width > 0:
         pygame.draw.rect(screen, GOLD, (bar_rect.x, bar_rect.y, fill_width, bar_rect.height), border_radius=9)
 
     flaw_render = font_small.render(f"Flaws: {sub['flaws']}", True, GREY)
-    screen.blit(flaw_render, flaw_render.get_rect(center=(WIDTH / 2, 250)))
+    screen.blit(flaw_render, flaw_render.get_rect(center=(WIDTH / 2, base_y + 100)))
 
     message_render = font_small.render(sub["message"], True, WHITE)
-    screen.blit(message_render, message_render.get_rect(center=(WIDTH / 2, 300)))
+    screen.blit(message_render, message_render.get_rect(center=(WIDTH / 2, base_y + 150)))
 
     for i, rect in enumerate(compute_kente_layout()):
         base_color = THREAD_COLORS[i]
@@ -1022,6 +995,34 @@ def draw_title(screen, fonts):
 
     hint = font_small.render("Press 1, 2, or 3 to begin.", True, WHITE)
     screen.blit(hint, hint.get_rect(center=(WIDTH / 2, y + 20)))
+
+
+MENU_BUTTON_LABEL = "Menu (Esc)"
+
+
+def compute_menu_button_rect(font_small):
+    """Top-right corner, inside the strip reserved above the Storyteller's
+    bubble (see BUBBLE_TOP). Drawn and hit-tested from this exact same
+    rect - the same pattern used for Oware's pits and Kente's pads - so a
+    click always lands on what's actually on screen. It's a pure function
+    of the font, not of draw order, so it can be called just as safely
+    from event handling (before this frame is drawn) as from drawing."""
+    label = font_small.render(MENU_BUTTON_LABEL, True, WHITE)
+    pad_x, pad_y = 14, 6
+    rect = pygame.Rect(0, 0, label.get_width() + pad_x * 2, label.get_height() + pad_y * 2)
+    rect.topright = (WIDTH - 12, 6)
+    return rect
+
+
+def draw_menu_button(screen, font_small, mouse_pos):
+    """Draw the return-to-menu button, lit up on hover so it reads as an
+    actual clickable control rather than an instructional label."""
+    rect = compute_menu_button_rect(font_small)
+    hovered = rect.collidepoint(mouse_pos)
+    pygame.draw.rect(screen, EMBER if hovered else (70, 55, 50), rect, border_radius=8)
+    pygame.draw.rect(screen, GOLD, rect, width=2, border_radius=8)
+    label = font_small.render(MENU_BUTTON_LABEL, True, WHITE)
+    screen.blit(label, label.get_rect(center=rect.center))
 
 
 def draw_story_end_overlay(screen, game, fonts):
@@ -1106,6 +1107,7 @@ def main():
 
     while running:
         now = pygame.time.get_ticks()
+        mouse_pos = pygame.mouse.get_pos()
         space_pressed = False
 
         for event in pygame.event.get():
@@ -1113,7 +1115,10 @@ def main():
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    running = False
+                    if game["state"] in ("PLAYING", "STORY_END"):
+                        game = {"state": "TITLE", "level": None, "sub": None}
+                    else:
+                        running = False
                 elif event.key in LEVEL_KEYS and game["state"] in ("TITLE", "STORY_END"):
                     game = new_game(LEVEL_KEYS[event.key], now)
                 elif event.key == pygame.K_SPACE and game["state"] == "STORY_END":
@@ -1123,7 +1128,9 @@ def main():
                 elif game["state"] == "PLAYING" and game["level"] == "kente":
                     handle_kente_keydown(game["sub"], event.key, storyteller, sounds, now)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if game["state"] == "PLAYING" and game["level"] == "oware":
+                if game["state"] in ("PLAYING", "STORY_END") and compute_menu_button_rect(font_small).collidepoint(event.pos):
+                    game = {"state": "TITLE", "level": None, "sub": None}
+                elif game["state"] == "PLAYING" and game["level"] == "oware":
                     handle_oware_click(game["sub"], event.pos, font_small, storyteller, sounds, now)
                 elif game["state"] == "PLAYING" and game["level"] == "kente":
                     handle_kente_click(game["sub"], event.pos, storyteller, sounds, now)
@@ -1163,6 +1170,10 @@ def main():
 
             if game["state"] == "STORY_END":
                 draw_story_end_overlay(screen, game, fonts)
+
+            # Drawn last so it's always fully lit, never dimmed by the
+            # STORY_END overlay drawn just above.
+            draw_menu_button(screen, font_small, mouse_pos)
 
         pygame.display.flip()
         clock.tick(FPS)
